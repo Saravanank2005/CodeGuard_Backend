@@ -1,0 +1,18 @@
+# Render Blueprint for Plagiarism Checker Backend
+# This file automates the deployment process on Render
+
+services:
+  - type: web
+    name: plagiarism-checker-backend
+    runtime: python
+    region: oregon
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn app:app --host 0.0.0.0 --port $PORT
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.12
+      - key: MONGODB_URL
+        sync: false  # You'll add this manually in Render dashboard
+    healthCheckPath: /health
+    autoDeploy: true
