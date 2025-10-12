@@ -3,7 +3,7 @@ uvicorn[standard]==0.32.1
 python-multipart==0.0.20
 scikit-learn==1.7.2
 joblib==1.4.2
-python-Levenshtein==0.27.0
+python-Levenshtein==0.27.1
 pymongo==4.10.1
 motor==3.6.0
 python-dotenv==1.0.1
