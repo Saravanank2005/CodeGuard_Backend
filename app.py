@@ -130,7 +130,7 @@ app.add_middleware(
         "http://localhost:3001",
         "http://127.0.0.1:3000",
         "http://127.0.0.1:3001",
-        "https://codeguard-frontend.vercel.app"
+        "https://code-guard-frontend-nu.vercel.app"
     ],
     allow_credentials=True,
     allow_methods=["*"],
