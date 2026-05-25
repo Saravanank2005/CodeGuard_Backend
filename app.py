@@ -8,7 +8,11 @@ import os
 from bson import ObjectId
 
 # ML/Similarity imports
-import Levenshtein
+try:
+    import Levenshtein
+    HAS_LEVENSHTEIN = True
+except ImportError:
+    HAS_LEVENSHTEIN = False
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
 import difflib
@@ -35,7 +39,9 @@ from models import (
     Token,
     SubmissionResponse,
     ReportResponse,
-    UserStatistics
+    UserStatistics,
+    StudentCodeEntry,
+    PasteSubmissionRequest
 )
 
 # Initialize FastAPI
@@ -54,12 +60,16 @@ def calculate_similarity(code1: str, code2: str) -> dict:
         code2_clean = ' '.join(code2.split())
         
         # Method 1: Levenshtein Distance (character-level similarity)
-        lev_distance = Levenshtein.distance(code1_clean, code2_clean)
-        max_len = max(len(code1_clean), len(code2_clean))
-        if max_len > 0:
-            sim_lex = 1 - (lev_distance / max_len)
+        if HAS_LEVENSHTEIN:
+            lev_distance = Levenshtein.distance(code1_clean, code2_clean)
+            max_len = max(len(code1_clean), len(code2_clean))
+            if max_len > 0:
+                sim_lex = 1 - (lev_distance / max_len)
+            else:
+                sim_lex = 1.0
         else:
-            sim_lex = 1.0
+            # Fallback to SequenceMatcher if Levenshtein is not available
+            sim_lex = difflib.SequenceMatcher(None, code1_clean, code2_clean).ratio()
         
         # Method 2: Sequence Matcher (ratio of matching subsequences)
         seqmatch = difflib.SequenceMatcher(None, code1_clean, code2_clean).ratio()
@@ -141,23 +151,27 @@ app.add_middleware(
 @app.on_event("startup")
 async def startup_event():
     """Initialize database connection on startup"""
-    await connect_to_mongo()
-    
-    # Create indexes for better performance
-    users_collection = get_users_collection()
-    if users_collection is not None:
-        await users_collection.create_index("email", unique=True)
-        await users_collection.create_index("created_at")
-    
-    submissions_collection = get_submissions_collection()
-    if submissions_collection is not None:
-        await submissions_collection.create_index("user_id")
-        await submissions_collection.create_index("created_at")
-    
-    reports_collection = get_reports_collection()
-    if reports_collection is not None:
-        await reports_collection.create_index("user_id")
-        await reports_collection.create_index("submission_id")
+    try:
+        await connect_to_mongo()
+        
+        # Create indexes for better performance
+        users_collection = get_users_collection()
+        if users_collection is not None:
+            await users_collection.create_index("email", unique=True)
+            await users_collection.create_index("created_at")
+        
+        submissions_collection = get_submissions_collection()
+        if submissions_collection is not None:
+            await submissions_collection.create_index("user_id")
+            await submissions_collection.create_index("created_at")
+        
+        reports_collection = get_reports_collection()
+        if reports_collection is not None:
+            await reports_collection.create_index("user_id")
+            await reports_collection.create_index("submission_id")
+    except Exception as e:
+        print(f"[WARN] Database initialization failed: {e}")
+        print("[WARN] App will start without database. Database operations will fail.")
 
 @app.on_event("shutdown")
 async def shutdown_event():
@@ -388,6 +402,143 @@ async def upload_submission(
         "plagiarism_detected": plagiarism_detected
     }
 
+# ============= PASTE CODE SUBMISSION (No file upload needed) =============
+
+@app.post("/api/submissions/paste")
+async def paste_submission(
+    payload: PasteSubmissionRequest,
+    current_user: dict = Depends(get_current_user)
+):
+    """Submit student code by pasting directly (no file upload). Requires authentication."""
+    submissions_collection = get_submissions_collection()
+    reports_collection = get_reports_collection()
+
+    if submissions_collection is None:
+        raise HTTPException(status_code=503, detail="Database not available")
+
+    if len(payload.students) < 2:
+        raise HTTPException(status_code=400, detail="At least 2 student submissions are required")
+
+    # Ensure student IDs are unique
+    student_ids = [s.student_id.strip() for s in payload.students]
+    if len(student_ids) != len(set(student_ids)):
+        raise HTTPException(status_code=400, detail="Student IDs must be unique")
+
+    # Build internal file-like list (matching upload structure)
+    uploaded_files = []
+    for student in payload.students:
+        uploaded_files.append({
+            "student_id": student.student_id.strip(),
+            "filename": f"{student.student_id.strip()}.{payload.language}",
+            "content": student.code,
+            "size": len(student.code.encode("utf-8")),
+            "uploaded_at": datetime.utcnow()
+        })
+
+    # Create submission record (store metadata only, not raw code, to keep DB lean)
+    submission = {
+        "user_id": current_user["_id"],
+        "user_email": current_user["email"],
+        "assignment_name": payload.assignment_name,
+        "language": payload.language,
+        "submission_mode": "paste",
+        "files": [
+            {
+                "student_id": f["student_id"],
+                "filename": f["filename"],
+                "size": f["size"],
+                "uploaded_at": f["uploaded_at"]
+            }
+            for f in uploaded_files
+        ],
+        "total_students": len(uploaded_files),
+        "status": "pending_analysis",
+        "created_at": datetime.utcnow()
+    }
+
+    result = await submissions_collection.insert_one(submission)
+    submission_id = str(result.inserted_id)
+
+    # Run plagiarism detection — same pipeline as file upload
+    comparisons = []
+    plagiarism_detected = False
+    high_risk_count = 0
+    medium_risk_count = 0
+    low_risk_count = 0
+
+    for i in range(len(uploaded_files)):
+        for j in range(i + 1, len(uploaded_files)):
+            s1 = uploaded_files[i]
+            s2 = uploaded_files[j]
+
+            similarity_data = calculate_similarity(s1["content"], s2["content"])
+            similarity = similarity_data["similarity"]
+            risk = get_risk_level(similarity)
+
+            if risk == "high":
+                high_risk_count += 1
+                plagiarism_detected = True
+            elif risk == "medium":
+                medium_risk_count += 1
+            else:
+                low_risk_count += 1
+
+            comparisons.append({
+                "student1_id": s1["student_id"],
+                "student1_file": s1["filename"],
+                "student2_id": s2["student_id"],
+                "student2_file": s2["filename"],
+                "similarity_score": round(similarity, 4),
+                "risk_level": risk,
+                "sim_lex": round(similarity_data["sim_lex"], 4),
+                "sim_ast": round(similarity_data["sim_ast"], 4),
+                "jaccard": round(similarity_data["jaccard"], 4),
+                "seqmatch": round(similarity_data["seqmatch"], 4)
+            })
+
+    # Save report
+    report = {
+        "user_id": current_user["_id"],
+        "submission_id": submission_id,
+        "assignment_name": payload.assignment_name,
+        "language": payload.language,
+        "submission_mode": "paste",
+        "total_students": len(uploaded_files),
+        "total_comparisons": len(comparisons),
+        "comparisons": comparisons,
+        "plagiarism_detected": plagiarism_detected,
+        "high_risk_count": high_risk_count,
+        "medium_risk_count": medium_risk_count,
+        "low_risk_count": low_risk_count,
+        "created_at": datetime.utcnow()
+    }
+    await reports_collection.insert_one(report)
+
+    await submissions_collection.update_one(
+        {"_id": ObjectId(submission_id)},
+        {"$set": {"status": "completed"}}
+    )
+
+    return {
+        "message": "Code pasted and analyzed successfully",
+        "submission_id": submission_id,
+        "total_students": len(uploaded_files),
+        "total_comparisons": len(comparisons),
+        "plagiarism_detected": plagiarism_detected,
+        "top_matches": [
+            {
+                "filename": f"{comp['student1_id']} vs {comp['student2_id']}",
+                "probability": comp["similarity_score"],
+                "sim_lex": comp["sim_lex"],
+                "sim_ast": comp["sim_ast"],
+                "jaccard": comp["jaccard"],
+                "seqmatch": comp["seqmatch"]
+            }
+            for comp in sorted(comparisons, key=lambda x: x["similarity_score"], reverse=True)[:10]
+        ]
+    }
+
+
 @app.get("/api/submissions")
 async def get_user_submissions(current_user: dict = Depends(get_current_user)):
     """Get all submissions for current user"""
@@ -404,8 +555,11 @@ async def get_user_submissions(current_user: dict = Depends(get_current_user)):
         submissions.append({
             "id": str(submission["_id"]),
             "assignment_name": submission["assignment_name"],
+            "language": submission.get("language", "py"),
+            "submission_mode": submission.get("submission_mode", "file"),
             "files_count": len(submission["files"]),
             "files": submission["files"],  # Include files array
+            "total_students": submission.get("total_students", len(submission["files"])),
             "status": submission["status"],
             "created_at": submission["created_at"].isoformat(),
             "timestamp": submission["created_at"].strftime("%Y-%m-%d %H:%M:%S")
@@ -705,6 +859,54 @@ async def root():
         "message": "CodeGuard API v2.0",
         "docs": "/docs",
         "health": "/health"
+    }
+
+# ============= MOCK/DEMO DATA (Optional) =============
+
+@app.get("/mock_statistics")
+async def mock_statistics():
+    """Return demo statistics for the dashboard when DB is not configured or empty.
+    This mirrors the shape returned by /api/statistics so the frontend charts work.
+    """
+    # Simple sample similarities spanning buckets (values are percentages 0-100)
+    similarities = [
+        {"student1": "23IT001", "student2": "23IT003", "assignment": "A_sumlist", "similarity": 18.0, "sim_lex": 22.0, "sim_ast": 15.0, "jaccard": 10.0, "seqmatch": 20.0, "risk_level": "low"},
+        {"student1": "23IT002", "student2": "23IT004", "assignment": "B_gcd", "similarity": 56.0, "sim_lex": 60.0, "sim_ast": 54.0, "jaccard": 40.0, "seqmatch": 58.0, "risk_level": "medium"},
+        {"student1": "23IT005", "student2": "23IT006", "assignment": "C_isprime", "similarity": 72.0, "sim_lex": 70.0, "sim_ast": 68.0, "jaccard": 55.0, "seqmatch": 74.0, "risk_level": "medium"},
+        {"student1": "23IT007", "student2": "23IT008", "assignment": "D_factorial", "similarity": 88.0, "sim_lex": 90.0, "sim_ast": 86.0, "jaccard": 80.0, "seqmatch": 92.0, "risk_level": "high"},
+        {"student1": "23IT009", "student2": "23IT010", "assignment": "D_factorial", "similarity": 83.0, "sim_lex": 84.0, "sim_ast": 82.0, "jaccard": 70.0, "seqmatch": 85.0, "risk_level": "high"}
+    ]
+
+    assignment_stats = [
+        {"assignment": "A_sumlist", "total_pairs": 10, "high_risk": 0, "medium_risk": 2, "low_risk": 8, "avg_similarity": 25.0},
+        {"assignment": "B_gcd", "total_pairs": 8, "high_risk": 1, "medium_risk": 3, "low_risk": 4, "avg_similarity": 48.0},
+        {"assignment": "C_isprime", "total_pairs": 6, "high_risk": 0, "medium_risk": 3, "low_risk": 3, "avg_similarity": 55.0},
+        {"assignment": "D_factorial", "total_pairs": 6, "high_risk": 2, "medium_risk": 2, "low_risk": 2, "avg_similarity": 66.0}
+    ]
+
+    top_suspects = [
+        {"student_id": "23IT008", "high_risk_count": 2, "medium_risk_count": 1, "total_submissions": 5, "avg_similarity": 78.0},
+        {"student_id": "23IT006", "high_risk_count": 1, "medium_risk_count": 2, "total_submissions": 4, "avg_similarity": 70.0}
+    ]
+
+    recent_submissions = [
+        {"assignment_name": "D_factorial", "total_students": 6, "status": "completed", "created_at": datetime.utcnow().isoformat()},
+        {"assignment_name": "C_isprime", "total_students": 6, "status": "completed", "created_at": datetime.utcnow().isoformat()}
+    ]
+
+    return {
+        "total_submissions": 4,
+        "total_reports": 4,
+        "total_comparisons": 30,
+        "total_students": 12,
+        "high_risk_count": 3,
+        "medium_risk_count": 8,
+        "low_risk_count": 19,
+        "high_risk_pairs": [s for s in similarities if s["risk_level"] == "high"],
+        "similarities": similarities,
+        "top_suspects": top_suspects,
+        "assignment_stats": assignment_stats,
+        "recent_submissions": recent_submissions
     }
 
 if __name__ == "__main__":

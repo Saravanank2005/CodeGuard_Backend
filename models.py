@@ -3,6 +3,17 @@ from pydantic import BaseModel, EmailStr, Field
 from typing import Optional, List
 from datetime import datetime
 
+# ---- Paste Submission Models ----
+
+class StudentCodeEntry(BaseModel):
+    student_id: str = Field(..., min_length=1)
+    code: str = Field(..., min_length=1)
+
+class PasteSubmissionRequest(BaseModel):
+    assignment_name: str = Field(..., min_length=1)
+    language: str = "python"
+    students: List[StudentCodeEntry] = Field(..., min_length=2)
+
 # User Models
 class UserRegister(BaseModel):
     email: EmailStr
